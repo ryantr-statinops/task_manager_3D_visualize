@@ -245,15 +245,15 @@ scene.add(boundingBox);
 /* =================================================================
    7. ORBIT CONTROLS
    ================================================================= */
-
-
-
-
-
-
-
-
-
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.set(0, MAX_HEIGHT * 0.3, 0);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.rotateSpeed = 0.8;
+controls.minDistance = 8;
+controls.maxDistance = 100;
+controls.maxPolarAngle = Math.PI / 2.1;
+controls.update();
 
 /* =================================================================
    8. VERTEX UPDATE — Lerp + height (single teal color)
@@ -739,6 +739,8 @@ function animate() {
   updateVertexBuffers(true);
 
   
+  /* OrbitControls damping update */
+  controls.update();
   renderer.render(scene, camera);
 
   redrawSideCharts();
