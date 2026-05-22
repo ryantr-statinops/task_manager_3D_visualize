@@ -16,3 +16,6 @@ Desktop.ini
 .vscode/
 .idea/
 *.log
+
+# Antigraity specific
+.antigravity/
