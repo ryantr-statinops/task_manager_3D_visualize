@@ -58,6 +58,84 @@ let historyNetwork   = { time: [], sent: [], recv: [] };
 let ramHistory       = [];
 const coreHistories  = Array.from({ length: CORE_COUNT }, () => []);
 
+/* ---- Time-Series Buffer for CPU Boxplot (5s blocks, rolling 60s) ---- */
+class TimeSeriesBuffer {
+  constructor(blockSize = 5, maxBlocks = 12) {
+    this.blockSize = blockSize;   // seconds per block
+    this.maxBlocks = maxBlocks;   // number of blocks to keep
+    this.blocks = [];             // Array<{ timestamp: string, coreValues: number[] }>
+    this.currentValues = [];      // Accumulating core values for current (in-progress) block
+    this.tickCount = 0;           // How many 1-second ticks in current block
+  }
+
+  /**
+   * Add a per-core sample (called every 1s)
+   * @param {number[]} coreValues - 16 core load values (0-100)
+   */
+  addSample(coreValues) {
+    if (!coreValues || coreValues.length === 0) return;
+    
+    // Accumulate all core values into current block
+    for (const v of coreValues) {
+      this.currentValues.push(Math.max(0, Math.min(100, v)));
+    }
+    this.tickCount++;
+
+    // If block is complete, finalize it
+    if (this.tickCount >= this.blockSize) {
+      this._finalizeBlock();
+    }
+  }
+
+  /**
+   * Finalize the current block and push it into the history
+   */
+  _finalizeBlock() {
+    const now = new Date();
+    const ts = String(now.getHours()).padStart(2, '0') + ':' +
+               String(now.getMinutes()).padStart(2, '0') + ':' +
+               String(now.getSeconds()).padStart(2, '0');
+
+    this.blocks.push({
+      timestamp: ts,
+      coreValues: [...this.currentValues],
+    });
+
+    // Trim old blocks
+    if (this.blocks.length > this.maxBlocks) {
+      this.blocks.shift();
+    }
+
+    // Reset current accumulator
+    this.currentValues = [];
+    this.tickCount = 0;
+  }
+
+  /**
+   * Get all finalized blocks
+   */
+  getBlocks() {
+    return this.blocks;
+  }
+
+  /**
+   * Get the accumulated raw values for the current (in-progress) block
+   */
+  getCurrentRawValues() {
+    return this.currentValues;
+  }
+
+  /**
+   * Check if we have any data yet
+   */
+  hasData() {
+    return this.blocks.length > 0 || this.currentValues.length > 0;
+  }
+}
+
+// Create a singleton time-series buffer
+const tsBuffer = new TimeSeriesBuffer(5, 12);
+
 /* =================================================================
    3. DOM REFERENCES
    ================================================================= */
@@ -336,7 +414,7 @@ function drawAllSparklines() {
 }
 
 /* =================================================================
-   11. BOXPLOT DRAWING
+   11. BOXPLOT DRAWING — Time-Series + Legacy
    ================================================================= */
 function computeBoxplot(values) {
   if (values.length === 0) return { min: 0, q1: 0, med: 0, q3: 0, max: 0 };
@@ -395,6 +473,199 @@ function drawBoxplot(canvas, bp, color) {
   ctx.beginPath();
   ctx.moveTo(mapX(bp.med), midY - boxH / 2);
   ctx.lineTo(mapX(bp.med), midY + boxH / 2);
+  ctx.stroke();
+}
+
+/* ---- Draw a single vertical boxplot (for time-series chart) ---- */
+function drawVerticalBoxplot(ctx, cx, topY, bottomY, boxWidth, bp, color) {
+  /* cx = center x, topY = y at 100%, bottomY = y at 0% */
+  // Use absolute 0-100% scale to match Y-axis labels and stripplot
+  const mapY = (v) => bottomY - (Math.max(0, Math.min(100, v)) / 100) * (bottomY - topY);
+
+  const yMin = mapY(bp.min);
+  const yMax = mapY(bp.max);
+  const yQ1  = mapY(bp.q1);
+  const yQ3  = mapY(bp.q3);
+  const yMed = mapY(bp.med);
+  const halfW = boxWidth / 2;
+
+  ctx.strokeStyle = color || '#21918c';
+  ctx.lineWidth = 1;
+
+  /* Whisker line (min to max) */
+  ctx.beginPath();
+  ctx.moveTo(cx, yMin);
+  ctx.lineTo(cx, yMax);
+  ctx.stroke();
+
+  /* Caps at min and max */
+  const capW = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx - capW, yMin);
+  ctx.lineTo(cx + capW, yMin);
+  ctx.moveTo(cx - capW, yMax);
+  ctx.lineTo(cx + capW, yMax);
+  ctx.stroke();
+
+  /* IQR Box */
+  const boxH = Math.max(2, Math.abs(yQ3 - yQ1));
+  const boxTop = Math.min(yQ1, yQ3);
+  ctx.fillStyle = color || '#21918c';
+  ctx.globalAlpha = 0.25;
+  ctx.fillRect(cx - halfW, boxTop, halfW * 2, boxH);
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = color || '#21918c';
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(cx - halfW, boxTop, halfW * 2, boxH);
+
+  /* Median line */
+  ctx.strokeStyle = color || '#21918c';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - halfW, yMed);
+  ctx.lineTo(cx + halfW, yMed);
+  ctx.stroke();
+}
+
+/* ---- Draw stripplot / scatterplot for current block raw values ---- */
+function drawStripplot(ctx, cx, topY, bottomY, boxWidth, rawValues, color) {
+  if (!rawValues || rawValues.length === 0) return;
+
+  const halfW = boxWidth * 0.35;
+  const r = 2.5;  // dot radius
+
+  for (let i = 0; i < rawValues.length; i++) {
+    const v = Math.max(0, Math.min(100, rawValues[i]));
+    const y = bottomY - (v / 100) * (bottomY - topY);
+
+    // Deterministic jitter based on index to keep dots stable within a block
+    const jitter = ((i / Math.max(1, rawValues.length - 1)) - 0.5) * halfW * 1.6;
+    const x = cx + jitter;
+
+    // Glow effect
+    ctx.shadowColor = color || '#21918c';
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = color || '#21918c';
+    ctx.globalAlpha = 0.85;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Inner bright core
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffffff';
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    ctx.arc(x, y, r * 0.45, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---- Draw the full time-series boxplot chart ---- */
+function drawTimeSeriesBoxplot(canvas, buffer) {
+  if (!canvas || !buffer || !buffer.hasData()) return;
+
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const margin = { left: 28, right: 4, top: 10, bottom: 18 };
+  const plotLeft = margin.left;
+  const plotTop = margin.top;
+  const plotW = W - margin.left - margin.right;
+  const plotH = H - margin.top - margin.bottom;
+
+  const color = '#21918c';
+  const blocks = buffer.getBlocks();
+  const currentRaw = buffer.getCurrentRawValues();
+  const hasCurrent = currentRaw.length > 0;
+
+  // Total slots = finalized blocks + 1 slot for current (if data exists)
+  const totalSlots = blocks.length + (hasCurrent ? 1 : 0);
+  if (totalSlots === 0) return;
+
+  const slotWidth = plotW / Math.max(totalSlots, 1);
+
+  // ---- Y-axis labels + grid lines ----
+  const yLabels = [0, 25, 50, 75, 100];
+  ctx.fillStyle = '#adb5bd';
+  ctx.font = '8px monospace';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  for (const pct of yLabels) {
+    const y = plotTop + plotH * (1 - pct / 100);
+    // Grid line
+    ctx.strokeStyle = '#f0f0f0';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(plotLeft, Math.round(y) + 0.5);
+    ctx.lineTo(W - margin.right, Math.round(y) + 0.5);
+    ctx.stroke();
+    // Label
+    ctx.fillStyle = '#adb5bd';
+    ctx.fillText(pct + '%', plotLeft - 3, y);
+  }
+
+  // ---- Render each finalized block as a vertical boxplot ----
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i];
+    const cx = plotLeft + i * slotWidth + slotWidth / 2;
+    const bp = computeBoxplot(block.coreValues);
+
+    drawVerticalBoxplot(ctx, cx, plotTop, plotTop + plotH, slotWidth * 0.6, bp, color);
+
+    // X-axis time label
+    ctx.fillStyle = '#adb5bd';
+    ctx.font = '7px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    // Only show every other label to avoid crowding
+    if (i % 2 === 0 || i === blocks.length - 1) {
+      ctx.fillText(block.timestamp.slice(3), cx, plotTop + plotH + 3);
+    }
+  }
+
+  // ---- Render the current (in-progress) block as a stripplot ----
+  if (hasCurrent) {
+    const cx = plotLeft + blocks.length * slotWidth + slotWidth / 2;
+
+    // Draw a subtle dashed vertical guide for the current block
+    ctx.strokeStyle = '#21918c';
+    ctx.lineWidth = 0.5;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx, plotTop);
+    ctx.lineTo(cx, plotTop + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw the scatter dots
+    drawStripplot(ctx, cx, plotTop, plotTop + plotH, slotWidth, currentRaw, color);
+
+    // Label for current block
+    ctx.fillStyle = '#21918c';
+    ctx.font = '7px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText('NOW', cx, plotTop + plotH + 3);
+  }
+
+  // ---- Horizontal axis baseline ----
+  ctx.strokeStyle = '#e5e7eb';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(plotLeft, plotTop + plotH + 0.5);
+  ctx.lineTo(W - margin.right, plotTop + plotH + 0.5);
+  ctx.stroke();
+
+  // ---- Y-axis left border ----
+  ctx.beginPath();
+  ctx.moveTo(plotLeft + 0.5, plotTop);
+  ctx.lineTo(plotLeft + 0.5, plotTop + plotH);
   ctx.stroke();
 }
 
@@ -552,8 +823,10 @@ function updateCoreBars(cores) {
   dom.cpuVar.textContent      = variance.toFixed(2);
   dom.cpuBarFill.style.width  = Math.min(avg, 100) + '%';
 
-  const bp = computeBoxplot(cores);
-  drawBoxplot(dom.boxplotCanvas, bp, '#21918c');
+  // Feed data into the time-series buffer for the rolling boxplot chart
+  tsBuffer.addSample(cores);
+  drawTimeSeriesBoxplot(dom.boxplotCanvas, tsBuffer);
+
   drawAllSparklines();
 }
 
@@ -714,6 +987,9 @@ function redrawSideCharts() {
   if (gpuHistory0.length > 1) {
     drawGpuTimeSeries(dom.gpuTimeseriesCanvas, gpuHistory0, gpuHistory1);
   }
+
+  // Refresh the time-series boxplot every cycle
+  drawTimeSeriesBoxplot(dom.boxplotCanvas, tsBuffer);
 
   if (latestMetrics && latestMetrics.memory_detail) {
     const pct = latestMetrics.memory_detail.percent || 0;
@@ -925,9 +1201,8 @@ function init() {
   clock = new THREE.Clock();
   updateVertexBuffers(false);
 
-  /* Initial boxplot */
-  const initCores = Array(CORE_COUNT).fill(5);
-  drawBoxplot(dom.boxplotCanvas, computeBoxplot(initCores), '#21918c');
+  /* Draw initial empty time-series chart */
+  drawTimeSeriesBoxplot(dom.boxplotCanvas, tsBuffer);
 
   animate();
   initWebSocket();

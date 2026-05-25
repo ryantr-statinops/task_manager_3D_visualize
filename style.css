@@ -242,6 +242,11 @@ body {
   margin-top: 3px;
 }
 
+/* ---------- Time-Series Boxplot specific ---------- */
+#boxplot-canvas {
+  cursor: crosshair;
+}
+
 /* ---------- Mem / GPU / Net text lines ---------- */
 .mem-line,
 .gpu-line {
