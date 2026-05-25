@@ -82,7 +82,26 @@
         <div class="stat-bar-track">
           <div class="stat-bar-fill ram-fill" id="ram-bar-fill" style="width:0%"></div>
         </div>
-        <canvas id="ram-boxplot-canvas" width="290" height="60"></canvas>
+        <!-- Single Hybrid Track: Allocation Blocks + Live Stripplot -->
+        <div id="ram-hybrid-track">
+          <div class="ram-track-inner">
+            <div class="allocation-blocks" id="allocation-blocks"></div>
+            <div class="process-dots" id="process-dots"></div>
+          </div>
+          <!-- Tooltip -->
+          <div class="ram-tooltip" id="ram-tooltip">
+            <span class="tooltip-name"></span>
+            <span class="tooltip-value"></span>
+          </div>
+          <!-- Ruler labels -->
+          <div class="ram-ruler">
+            <span>0%</span>
+            <span>25%</span>
+            <span>50%</span>
+            <span>75%</span>
+            <span>100%</span>
+          </div>
+        </div>
       </section>
 
       <!-- GPU Telemetry -->

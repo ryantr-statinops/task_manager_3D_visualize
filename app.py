@@ -172,6 +172,9 @@ class SystemMonitor:
                 "total_gb": round(mem.total / (1024**3), 1),
                 "used_gb": round(mem.used / (1024**3), 1),
                 "percent": round(mem.percent, 1),
+                "processes": await loop.run_in_executor(
+                    None, self._get_top_processes
+                ),
             },
             gpu_detail=gpu_detail,
         )
@@ -230,6 +233,48 @@ class SystemMonitor:
             primary_temp = gpus[0].temperature
 
         return primary_load, primary_vram, primary_temp, detail
+
+    # ------------------------------------------------------------------
+    # Top Processes by Memory
+    # ------------------------------------------------------------------
+
+    def _get_top_processes(self, count: int = 15) -> List[Dict[str, Any]]:
+        """Return the top-N processes sorted by memory usage (RSS).
+
+        Uses ``psutil.process_iter()`` with a one-shot snapshot to
+        minimise overhead. Processes that are inaccessible (zombies,
+        permission-denied) are silently skipped.
+        """
+        results: List[Dict[str, Any]] = []
+        try:
+            for proc in psutil.process_iter(
+                ["pid", "name", "memory_percent", "memory_info"]
+            ):
+                try:
+                    info = proc.info
+                    pid: int = info["pid"]
+                    name: str = info["name"] or ""
+                    mem_pct: float = info["memory_percent"] or 0.0
+                    mem_info = info["memory_info"]
+                    rss_mb: float = (
+                        round(mem_info.rss / (1024 * 1024), 1)
+                        if mem_info and mem_info.rss
+                        else 0.0
+                    )
+                    results.append({
+                        "pid": pid,
+                        "name": name,
+                        "memory_percent": round(mem_pct, 2),
+                        "memory_mb": rss_mb,
+                    })
+                except (psutil.NoSuchProcess, psutil.AccessDenied, TypeError):
+                    continue
+        except Exception:
+            pass
+
+        # Sort descending by memory_percent and take top N
+        results.sort(key=lambda p: p["memory_percent"], reverse=True)
+        return results[:count]
 
     # ------------------------------------------------------------------
     # Network Speed (Delta-based)

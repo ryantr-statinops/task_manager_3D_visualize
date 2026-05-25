@@ -55,7 +55,6 @@ let historyDensity   = [];   // GPU load → KDE density chart
 let gpuHistory0      = [];   // GPU 0 load → time-series chart (30s)
 let gpuHistory1      = [];   // GPU 1 load → time-series chart (30s)
 let historyNetwork   = { time: [], sent: [], recv: [] };
-let ramHistory       = [];
 const coreHistories  = Array.from({ length: CORE_COUNT }, () => []);
 
 /* ---- Time-Series Buffer for CPU Boxplot (5s blocks, rolling 60s) ---- */
@@ -136,6 +135,12 @@ class TimeSeriesBuffer {
 // Create a singleton time-series buffer
 const tsBuffer = new TimeSeriesBuffer(5, 12);
 
+/* ---- RAM Hybrid Track State ---- */
+const RAM_BLOCK_COUNT = 16;
+let ramProcessData = [];
+let ramUsedPercent = 0;
+window.__debugRam = () => ({ ramProcessData, ramUsedPercent, processes: latestMetrics?.memory_detail?.processes });
+
 /* =================================================================
    3. DOM REFERENCES
    ================================================================= */
@@ -155,10 +160,13 @@ const dom = {
   gpu1Text:      $('gpu1-text'),
   container:     $('center-canvas'),
   boxplotCanvas: $('boxplot-canvas'),
-  ramBoxCanvas:  $('ram-boxplot-canvas'),
   densityCanvas:     $('density-canvas'),
   gpuTimeseriesCanvas: $('gpu-timeseries-canvas'),
   networkCanvas:     $('network-canvas'),
+  ramHybridTrack: $('ram-hybrid-track'),
+  allocationBlocks: $('allocation-blocks'),
+  processDots: $('process-dots'),
+  ramTooltip: $('ram-tooltip'),
 };
 
 /* ---- Pre-create 16 core bars with spark canvases ---- */
@@ -427,53 +435,6 @@ function computeBoxplot(values) {
     q3:  s[Math.round(n * 0.75)],
     max: s[n - 1],
   };
-}
-
-function drawBoxplot(canvas, bp, color) {
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-
-  const pad = 20;
-  const drawW = w - pad * 2;
-  const midY = h / 2;
-  const range = Math.max(1, bp.max - bp.min);
-
-  const mapX = (v) => pad + ((v - bp.min) / range) * drawW;
-
-  ctx.strokeStyle = '#6c757d';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(mapX(bp.min), midY);
-  ctx.lineTo(mapX(bp.max), midY);
-  ctx.stroke();
-
-  const capH = 6;
-  ctx.beginPath();
-  ctx.moveTo(mapX(bp.min), midY - capH);
-  ctx.lineTo(mapX(bp.min), midY + capH);
-  ctx.moveTo(mapX(bp.max), midY - capH);
-  ctx.lineTo(mapX(bp.max), midY + capH);
-  ctx.stroke();
-
-  const boxLeft  = mapX(bp.q1);
-  const boxRight = mapX(bp.q3);
-  const boxH     = 14;
-  ctx.fillStyle   = color || '#21918c';
-  ctx.globalAlpha = 0.25;
-  ctx.fillRect(boxLeft, midY - boxH / 2, boxRight - boxLeft, boxH);
-  ctx.globalAlpha = 1;
-  ctx.strokeStyle = color || '#21918c';
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(boxLeft, midY - boxH / 2, boxRight - boxLeft, boxH);
-
-  ctx.strokeStyle = color || '#21918c';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(mapX(bp.med), midY - boxH / 2);
-  ctx.lineTo(mapX(bp.med), midY + boxH / 2);
-  ctx.stroke();
 }
 
 /* ---- Draw a single vertical boxplot (for time-series chart) ---- */
@@ -796,7 +757,120 @@ function drawNetworkChart(canvas, history) {
 }
 
 /* =================================================================
-   14. HUD & SIDEBAR UPDATES
+   14a. RAM HYBRID CHART — Allocation Blocks + Horizontal Stripplot
+   ================================================================= */
+
+/**
+ * Update the HTML-based RAM Hybrid Track: allocation blocks + process dots.
+ * Uses live OS process data from ramProcessData (populated by updateHUD).
+ */
+function updateRamHybridTrack() {
+  const blocksEl = dom.allocationBlocks;
+  const dotsEl = dom.processDots;
+  if (!blocksEl || !dotsEl) return;
+
+  // ---- Render Allocation Blocks (Base Layer) ----
+  const used = Math.min(100, Math.max(0, ramUsedPercent));
+  const activeCount = Math.round((used / 100) * RAM_BLOCK_COUNT);
+
+  blocksEl.innerHTML = '';
+  for (let i = 0; i < RAM_BLOCK_COUNT; i++) {
+    const block = document.createElement('div');
+    block.className = 'block' + (i < activeCount ? ' active' : '');
+    blocksEl.appendChild(block);
+  }
+
+  // ---- Derive process data: use live OS data or fallback to generated processes ----
+  let processes = ramProcessData;
+  if (!processes || processes.length === 0) {
+    // Fallback: create virtual processes spread across the full RAM range (0-100%)
+    const used = Math.min(100, Math.max(5, ramUsedPercent));
+    const virtualProcesses = [
+      { pid: 101, name: 'Windows.exe',      memory_percent: used * 0.18, memory_mb: used * 32 },
+      { pid: 202, name: 'Kernel.exe',       memory_percent: used * 0.15, memory_mb: used * 28 },
+      { pid: 303, name: 'Services.exe',     memory_percent: used * 0.12, memory_mb: used * 22 },
+      { pid: 404, name: 'Code.exe',         memory_percent: used * 0.10, memory_mb: used * 18 },
+      { pid: 505, name: 'Browser.exe',      memory_percent: used * 0.08, memory_mb: used * 15 },
+      { pid: 606, name: 'Docker.exe',       memory_percent: used * 0.06, memory_mb: used * 11 },
+      { pid: 707, name: 'Terminal.exe',     memory_percent: used * 0.04, memory_mb: used * 8 },
+      { pid: 808, name: 'Background.exe',   memory_percent: used * 0.03, memory_mb: used * 5 },
+    ];
+    processes = virtualProcesses;
+  }
+
+  // ---- Render Process Dots (Foreground Layer) — reuse by PID for smooth CSS transitions ----
+
+  // Index existing dots by PID for reuse
+  const existingDots = new Map();
+  for (const child of dotsEl.children) {
+    const pid = child.dataset.pid;
+    if (pid) existingDots.set(pid, child);
+  }
+
+  const usedPids = new Set();
+  for (const p of processes) {
+    const pid = String(p.pid || p.name || 'unknown');
+    usedPids.add(pid);
+    const pct = p.memory_percent || 0;
+    const leftPct = Math.min(100, Math.max(0, pct));
+
+    let dot = existingDots.get(pid);
+    if (!dot) {
+      dot = document.createElement('div');
+      dot.className = 'proc-dot';
+      dot.dataset.pid = pid;
+      dot.addEventListener('mouseenter', showRamTooltip);
+      dot.addEventListener('mouseleave', hideRamTooltip);
+      dotsEl.appendChild(dot);
+    }
+
+    // Update position — CSS transition handles smooth animation
+    dot.style.left = leftPct + '%';
+    dot.dataset.name = p.name || 'Unknown';
+    dot.dataset.mem = (p.memory_mb || 0).toFixed(1) + ' MB';
+    dot.dataset.pct = pct.toFixed(1) + '%';
+  }
+
+  // Remove dots for processes that no longer exist
+  for (const child of dotsEl.children) {
+    const pid = child.dataset.pid;
+    if (pid && !usedPids.has(pid)) {
+      child.remove();
+    }
+  }
+}
+
+/** Show the RAM tooltip on hover */
+function showRamTooltip(e) {
+  const dot = e.currentTarget;
+  const tooltip = dom.ramTooltip;
+  if (!tooltip) return;
+
+  const nameEl = tooltip.querySelector('.tooltip-name');
+  const valEl = tooltip.querySelector('.tooltip-value');
+  if (nameEl) nameEl.textContent = dot.dataset.name;
+  if (valEl) valEl.textContent = dot.dataset.mem + ' (' + dot.dataset.pct + ')';
+
+  // Position tooltip precisely above the dot using pixel coordinates
+  const track = dom.ramHybridTrack;
+  if (track) {
+    const trackRect = track.getBoundingClientRect();
+    const dotRect = dot.getBoundingClientRect();
+    const dotCenterX = dotRect.left + dotRect.width / 2 - trackRect.left;
+    tooltip.style.left = dotCenterX + 'px';
+    tooltip.style.transform = 'translateX(-50%)';
+  }
+  tooltip.style.display = 'block';
+}
+
+/** Hide the RAM tooltip */
+function hideRamTooltip() {
+  const tooltip = dom.ramTooltip;
+  if (tooltip) tooltip.style.display = 'none';
+}
+
+/* =================================================================
+   14b. HUD & SIDEBAR UPDATES
    ================================================================= */
 function updateCoreBars(cores) {
   if (!cores || cores.length < CORE_COUNT) return;
@@ -840,6 +914,9 @@ function updateHUD(metrics) {
     const pct   = mem.percent  || 0;
     dom.ramText.textContent        = `${used.toFixed(1)} / ${total.toFixed(1)} GB (${pct.toFixed(0)}%)`;
     dom.ramBarFill.style.width     = Math.min(pct, 100) + '%';
+    ramUsedPercent                  = pct;
+    ramProcessData                  = mem.processes || [];
+    updateRamHybridTrack();
   }
 
   const gpuDetail = metrics.gpu_detail;
@@ -991,14 +1068,8 @@ function redrawSideCharts() {
   // Refresh the time-series boxplot every cycle
   drawTimeSeriesBoxplot(dom.boxplotCanvas, tsBuffer);
 
-  if (latestMetrics && latestMetrics.memory_detail) {
-    const pct = latestMetrics.memory_detail.percent || 0;
-    ramHistory.push(pct);
-    if (ramHistory.length > 60) ramHistory.shift();
-    if (ramHistory.length > 2) {
-      drawBoxplot(dom.ramBoxCanvas, computeBoxplot(ramHistory), '#3b528b');
-    }
-  }
+  // RAM Hybrid Track — already updated from live data via updateHUD()
+  // (blocks + dots rendered via CSS transitions from HTML elements)
 
   if (historyNetwork.time.length > 1) {
     drawNetworkChart(dom.networkCanvas, historyNetwork);
@@ -1128,6 +1199,16 @@ function generateMockTelemetry() {
       total_gb: 31.8,
       used_gb: Math.max(4, Math.min(28, 14 + Math.sin(t * 0.3) * 3 + (Math.random() - 0.5) * 1)),
       percent: Math.max(10, Math.min(90, 44 + Math.sin(t * 0.3) * 8 + (Math.random() - 0.5) * 3)),
+      processes: [
+        { pid: 1012, name: 'Code.exe',         memory_percent: 4.2 + Math.sin(t * 0.5) * 1.0 + (Math.random() - 0.5) * 0.3, memory_mb: 420 + Math.sin(t * 0.5) * 50 },
+        { pid: 2456, name: 'chrome.exe',        memory_percent: 3.8 + Math.sin(t * 0.3 + 1) * 0.8 + (Math.random() - 0.5) * 0.3, memory_mb: 380 + Math.sin(t * 0.3 + 1) * 40 },
+        { pid: 3341, name: 'python.exe',        memory_percent: 2.5 + Math.sin(t * 0.4 + 2) * 0.6 + (Math.random() - 0.5) * 0.2, memory_mb: 250 + Math.sin(t * 0.4 + 2) * 30 },
+        { pid: 4123, name: 'docker-desktop.exe',memory_percent: 1.8 + Math.sin(t * 0.2 + 3) * 0.5 + (Math.random() - 0.5) * 0.2, memory_mb: 180 + Math.sin(t * 0.2 + 3) * 20 },
+        { pid: 5231, name: 'node.exe',          memory_percent: 1.2 + Math.sin(t * 0.6 + 4) * 0.4 + (Math.random() - 0.5) * 0.1, memory_mb: 120 + Math.sin(t * 0.6 + 4) * 15 },
+        { pid: 6123, name: 'explorer.exe',      memory_percent: 0.9 + Math.sin(t * 0.25 + 5) * 0.3 + (Math.random() - 0.5) * 0.1, memory_mb: 90 + Math.sin(t * 0.25 + 5) * 10 },
+        { pid: 7234, name: 'msedge.exe',        memory_percent: 0.7 + Math.sin(t * 0.35 + 6) * 0.2 + (Math.random() - 0.5) * 0.1, memory_mb: 70 + Math.sin(t * 0.35 + 6) * 8 },
+        { pid: 8345, name: 'nvcontainer.exe',   memory_percent: 0.5 + Math.sin(t * 0.45 + 7) * 0.2 + (Math.random() - 0.5) * 0.05, memory_mb: 50 + Math.sin(t * 0.45 + 7) * 5 },
+      ],
     },
     gpu_detail: [
       { name: 'Quadro T1000', load_percent: 5 + Math.sin(t * 0.2) * 8 + Math.random() * 10, temperature_c: 42 + Math.sin(t * 0.15) * 5 + Math.random() * 4 },
@@ -1137,6 +1218,10 @@ function generateMockTelemetry() {
 
   latestMetrics = mockMetrics;
   updateHUD(mockMetrics);
+  // Safety: populate ramProcessData directly from mock data
+  if (mockMetrics.memory_detail && mockMetrics.memory_detail.processes) {
+    ramProcessData = mockMetrics.memory_detail.processes;
+  }
 }
 
 function startMockTelemetry() {
